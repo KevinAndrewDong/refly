@@ -2,6 +2,9 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const ts = require('typescript');
+
+const dynamicValue = Symbol('dynamic translation value');
 
 /**
  * Refly I18n Translation Consistency Checker
@@ -51,71 +54,101 @@ class I18nConsistencyChecker {
    */
   extractTranslationKeys(filePath) {
     try {
+      if (typeof filePath !== 'string') throw new Error('invalid file path');
       const content = fs.readFileSync(filePath, 'utf8');
-
-      // match const translations = { ... } pattern
-      const translationMatch = content.match(
-        /const translations = ({[\s\S]*?});?\s*export default translations/,
+      const source = ts.createSourceFile(
+        filePath,
+        content,
+        ts.ScriptTarget.Latest,
+        false,
+        ts.ScriptKind.TS,
       );
-      if (!translationMatch) {
-        throw new Error(`failed to parse translation object: ${filePath}`);
+      if (source.parseDiagnostics.length) throw new Error('invalid translation syntax');
+
+      const exports = source.statements.filter(ts.isExportAssignment);
+      if (
+        exports.length !== 1 ||
+        exports[0].isExportEquals ||
+        !ts.isIdentifier(exports[0].expression) ||
+        exports[0].expression.text !== 'translations'
+      ) {
+        throw new Error('expected translations as the default export');
       }
 
-      // clean and preprocess translation object string
-      let translationStr = translationMatch[1];
-
-      // process template strings and function calls
-      translationStr = translationStr.replace(/t\([^)]+\)/g, '"__TEMPLATE_FUNCTION__"');
-      translationStr = translationStr.replace(/returnObjects:\s*true/g, '"__RETURN_OBJECTS__"');
-
-      // safely evaluate translation object
-      const translationObj = this.safeEval(translationStr);
-
-      return this.flattenTranslationObject(translationObj);
-    } catch (error) {
+      const declarations = source.statements
+        .filter(
+          (statement) =>
+            ts.isVariableStatement(statement) &&
+            statement.declarationList.flags & ts.NodeFlags.Const,
+        )
+        .flatMap((statement) => statement.declarationList.declarations)
+        .filter(
+          (declaration) =>
+            ts.isIdentifier(declaration.name) && declaration.name.text === 'translations',
+        );
+      if (
+        declarations.length !== 1 ||
+        !declarations[0].initializer ||
+        !ts.isObjectLiteralExpression(declarations[0].initializer)
+      ) {
+        throw new Error('expected a static translations object');
+      }
+      return this.flattenTranslationObject(declarations[0].initializer);
+    } catch {
       this.errors.push({
         type: 'parse_error',
-        file: filePath,
-        message: `failed to parse file: ${error.message}`,
+        file: typeof filePath === 'string' ? filePath : undefined,
+        message: 'failed to parse translation object',
       });
       return {};
     }
   }
 
   /**
-   * safely evaluate translation object
-   */
-  safeEval(str) {
-    try {
-      // use Function constructor instead of eval for security
-      return new Function(`return ${str}`)();
-    } catch (error) {
-      throw new Error(`translation object syntax error: ${error.message}`);
-    }
-  }
-
-  /**
-   * flatten nested translation object to dot notation keys
+   * Flatten static object keys; never execute translation expressions.
+   * Literal values preserve the existing empty/untranslated-text checks.
    */
   flattenTranslationObject(obj, prefix = '') {
-    const flattened = {};
-
-    for (const key in obj) {
-      if (Object.hasOwn(obj, key)) {
-        const fullKey = prefix ? `${prefix}.${key}` : key;
-        const value = obj[key];
-
-        if (value && typeof value === 'object' && !Array.isArray(value)) {
-          // recursively process nested objects
-          Object.assign(flattened, this.flattenTranslationObject(value, fullKey));
-        } else {
-          // leaf node
-          flattened[fullKey] = value;
-        }
+    const properties = new Map();
+    for (const property of obj.properties) {
+      if (
+        !ts.isPropertyAssignment(property) ||
+        property.questionToken ||
+        property.exclamationToken ||
+        property.modifiers?.length ||
+        !(
+          ts.isIdentifier(property.name) ||
+          ts.isStringLiteral(property.name) ||
+          ts.isNumericLiteral(property.name)
+        )
+      ) {
+        throw new Error('expected a static property name');
       }
+      // Match ordinary object overwrite behavior without evaluating any values.
+      properties.set(property.name.text, property.initializer);
     }
 
-    return flattened;
+    const flattened = new Map();
+    for (const [key, value] of properties) {
+      const fullKey = prefix ? `${prefix}.${key}` : key;
+      if (ts.isObjectLiteralExpression(value)) {
+        for (const [nestedKey, nestedValue] of Object.entries(
+          this.flattenTranslationObject(value, fullKey),
+        )) {
+          flattened.set(nestedKey, nestedValue);
+        }
+      } else if (ts.isStringLiteralLike(value)) {
+        flattened.set(fullKey, value.text);
+      } else if (value.kind === ts.SyntaxKind.NullKeyword) {
+        flattened.set(fullKey, null);
+      } else if (ts.isIdentifier(value) && value.text === 'undefined') {
+        flattened.set(fullKey, undefined);
+      } else {
+        flattened.set(fullKey, dynamicValue);
+      }
+    }
+    // Keep keys such as __proto__ as data rather than invoking object setters.
+    return Object.fromEntries(flattened);
   }
 
   /**
